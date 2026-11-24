@@ -128,3 +128,5 @@ Auto-detection uses the `lint`, `typecheck`/`type-check`/`tsc` and `test:unit`/`
 - Only commits made **through Claude Code** are gated. Your own terminal commits are untouched (they show as "unstamped" in `cv report`).
 - If your full test suite is slow, set `fastChecks` so the Stop hook stays fast, and keep heavy E2E runs for `/verify`.
 - Commit message detection covers `-m`, heredocs and `-F <file>`. Exotic forms (e.g. a message from an editor) are treated as unstamped.
+
+## Inspired by https://x.com/addyosmani/status/2122590683055993308
