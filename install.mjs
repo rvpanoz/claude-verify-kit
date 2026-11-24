@@ -28,6 +28,7 @@ const log = (...a) => console.log((DRY ? '[dry-run] ' : '') + a.join(' '));
 const q = (p) => `"${p.replace(/\\/g, '/')}"`;
 const STOP_CMD = `node ${q(path.join(KIT, 'bin', 'stop-checks.mjs'))}`;
 const GATE_CMD = `node ${q(path.join(KIT, 'bin', 'commit-gate.mjs'))}`;
+const POST_CMD = `node ${q(path.join(KIT, 'bin', 'post-commit.mjs'))}`;
 
 // Files the user is expected to edit: never overwritten on update.
 const USER_OWNED = new Set(['checklist.md', 'config.json']);
@@ -78,10 +79,10 @@ function writeSettings(s) {
   log('write  ', SETTINGS);
 }
 
-const isOurs = (h) => /stop-checks\.mjs|commit-gate\.mjs/.test(h?.command || '');
+const isOurs = (h) => /verification[\\/]bin[\\/](?:stop-checks|commit-gate|post-commit)\.mjs/.test(h?.command || '');
 
 function stripOurHooks(s) {
-  for (const ev of ['Stop', 'PreToolUse']) {
+  for (const ev of ['Stop', 'PreToolUse', 'PostToolUse', 'PostToolUseFailure']) {
     if (!Array.isArray(s.hooks?.[ev])) continue;
     s.hooks[ev] = s.hooks[ev]
       .map((g) => ({ ...g, hooks: (g.hooks || []).filter((h) => !isOurs(h)) }))
@@ -95,10 +96,24 @@ function stripOurHooks(s) {
 function updateClaudeMd(add) {
   let md = fs.existsSync(CLAUDE_MD) ? fs.readFileSync(CLAUDE_MD, 'utf8') : '';
   const re = new RegExp(`\\n?${START}[\\s\\S]*?${END}\\n?`);
-  const had = re.test(md);
-  md = md.replace(re, '\n');
-  if (add) md = md.trimEnd() + (md.trim() ? '\n\n' : '') + fs.readFileSync(path.join(SRC, 'CLAUDE.snippet.md'), 'utf8');
+  const snippet = fs.readFileSync(path.join(SRC, 'CLAUDE.snippet.md'), 'utf8');
+  const old = md.match(re)?.[0].trim() ?? null;
+  const had = old != null;
+  if (add && old === snippet.trim()) return; // already up to date
   if (!add && !had) return;
+  md = md.replace(re, '\n');
+  if (add) md = md.trimEnd() + (md.trim() ? '\n\n' : '') + snippet;
+  // The block between the markers belongs to the kit and is replaced as a whole, so keep a copy
+  // in case it was edited by hand.
+  if (had) {
+    const bak = `${CLAUDE_MD}.bak-${new Date().toISOString().replace(/[:.]/g, '-')}`;
+    if (!DRY) fs.copyFileSync(CLAUDE_MD, bak);
+    log('backup ', bak);
+    console.log(
+      `  note: the kit's block in ${CLAUDE_MD} is replaced on every update/uninstall. If you edited it, ` +
+        `your version is in the backup; keep personal rules outside the claude-verify-kit markers.`,
+    );
+  }
   log(add ? (had ? 'update ' : 'append ') : 'remove ', `${CLAUDE_MD} (verification block)`);
   if (!DRY) fs.writeFileSync(CLAUDE_MD, md.trimEnd() + '\n');
 }
@@ -169,6 +184,9 @@ const s = stripOurHooks(readSettings());
 s.hooks ||= {};
 (s.hooks.Stop ||= []).push({ hooks: [{ type: 'command', command: STOP_CMD, timeout: 600 }] });
 (s.hooks.PreToolUse ||= []).push({ matcher: 'Bash', hooks: [{ type: 'command', command: GATE_CMD, timeout: 30 }] });
+// After the commit, success or failure (the commit can exist even if a later `&& git push` fails).
+for (const ev of ['PostToolUse', 'PostToolUseFailure'])
+  (s.hooks[ev] ||= []).push({ matcher: 'Bash', hooks: [{ type: 'command', command: POST_CMD, timeout: 30 }] });
 writeSettings(s);
 updateClaudeMd(true);
 const rc = NO_ALIAS ? null : updateAlias(true);
@@ -176,7 +194,7 @@ const rc = NO_ALIAS ? null : updateAlias(true);
 console.log(`
 ✔ Installed.
   Skills:  /verify and /review-changes   (in ${path.join(CLAUDE, 'skills')})
-  Hooks:   Stop → fast checks; before git commit → commit gate (mode: observe)
+  Hooks:   Stop → fast checks; before git commit → commit gate (mode: observe); after → commit ledger
   Command: cv  →  node ${CV_PATH}
 
 Next steps:

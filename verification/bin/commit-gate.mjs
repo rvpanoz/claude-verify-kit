@@ -1,91 +1,85 @@
 #!/usr/bin/env node
 // Claude Code "PreToolUse" hook (matcher: Bash): gates `git commit` commands Claude runs.
 //
-// Every commit Claude makes must carry a stamp trailer saying how it was verified:
-//   Verified-By: verify, review            (kinds that passed for this exact working tree)
-//   Verified-By: none - <reason>           (explicit, queryable opt-out)
+// A commit goes through when the records the repo requires (default: verify) passed for this
+// exact working tree, or when the tree was explicitly waived with `cv waive "<reason>"`.
+// Nothing is added to the commit message: the outcome is written to a local ledger by the
+// PostToolUse hook (post-commit.mjs) once the commit exists.
 // Modes: off | observe (log what would be blocked) | enforce (block).
 // After `maxGateBlocks` blocks in one session the next commit is let through, so Claude can't get stuck.
 // Commits you make yourself in a terminal are never touched.
 import fs from 'node:fs';
 import path from 'node:path';
-import { git, readStdinJson, repoInfo, loadConfig, fingerprint, freshKinds, readJson, writeJson, appendLog, KINDS } from './lib.mjs';
+import {
+  readStdinJson, repoInfo, loadConfig, fingerprint, freshKinds, waiverFor, commitTarget, readLedger,
+  pendingCommitPath, reflogLength, readJson, writeJson, appendLog, KINDS,
+} from './lib.mjs';
+
+const CV = 'node ~/.claude/verification/bin/cv.mjs';
 
 const input = readStdinJson();
 if (input.tool_name !== 'Bash') process.exit(0);
 const command = String(input.tool_input?.command || '');
 
-// `git [-C dir] [-c k=v] ... commit ...`
-const COMMIT_RE = /(?:^|[\s;&|(])git((?:\s+(?:-C\s+(?:"[^"]*"|'[^']*'|\S+)|-c\s+\S+|--[\w-]+(?:=\S+)?))*)\s+commit\b/;
-const m = command.match(COMMIT_RE);
-if (!m) process.exit(0);
+const target = commitTarget(command, input.cwd || process.cwd());
+if (!target) process.exit(0);
 
-let cwd = input.cwd || process.cwd();
-const dashC = (m[1] || '').match(/-C\s+("([^"]*)"|'([^']*)'|(\S+))/);
-if (dashC) cwd = path.resolve(cwd, dashC[2] ?? dashC[3] ?? dashC[4]);
-
-const info = repoInfo(cwd);
+const info = repoInfo(target.cwd);
 if (!info) process.exit(0);
 const cfg = loadConfig(info);
-if (cfg.gate === 'off') process.exit(0);
-
-// ---- find the commit message text ----
-let message = command;
-const fileArg = command.match(/\s(?:-F|--file)(?:\s+|=)("([^"]+)"|'([^']+)'|(\S+))/);
-if (fileArg) {
-  const f = fileArg[2] ?? fileArg[3] ?? fileArg[4];
-  if (f !== '-') {
-    try {
-      message += '\n' + fs.readFileSync(path.resolve(cwd, f), 'utf8');
-    } catch {
-      /* unreadable */
-    }
-  }
-}
-if (/--amend\b/.test(command) && /--no-edit\b/.test(command)) {
-  const r = git(['log', '-1', '--format=%B'], info.root);
-  message += '\n' + r.out;
+if (cfg.gate === 'off') {
+  fs.rmSync(pendingCommitPath(info), { force: true }); // don't let an old outcome attach to this commit
+  process.exit(0);
 }
 
 // ---- evaluate ----
+const amend = /--amend\b/.test(command);
 const fp = fingerprint(info);
 const fresh = fp ? freshKinds(info, fp) : [];
+const waiver = fp ? waiverFor(info, fp) : null;
 const required = (cfg.require || []).filter((k) => KINDS.includes(k));
-const stamp = message.match(/Verified-By:\s*([^\n"'\\]*)/i);
-const suggested = fresh.length ? `Verified-By: ${fresh.join(', ')}` : 'Verified-By: none - <why it was not verified>';
+const missing = required.filter((k) => !fresh.includes(k));
 
 let problem = null;
-if (!fp && !/--amend\b/.test(command)) {
-  problem = null; // nothing to commit; let git say so
-} else if (!stamp) {
-  problem = `commit has no verification stamp. Add the trailer \`${suggested}\` as the last line of the message.`;
-} else {
-  const value = stamp[1].trim();
-  if (/^none\b/i.test(value)) {
-    if (!/^none\s*[-–—:(]\s*\S{3,}/i.test(value)) problem = 'a `Verified-By: none` stamp needs a reason, e.g. `Verified-By: none - docs only`.';
-  } else {
-    const claimed = value.split(/[\s,]+/).map((s) => s.toLowerCase()).filter(Boolean);
-    const unknown = claimed.filter((k) => !KINDS.includes(k));
-    const stale = claimed.filter((k) => KINDS.includes(k) && !fresh.includes(k));
-    const missing = required.filter((k) => !fresh.includes(k));
-    if (unknown.length) problem = `unknown stamp value(s): ${unknown.join(', ')}. Use ${KINDS.join(' / ')} or none - <reason>.`;
-    else if (stale.length)
-      problem =
-        `stamp claims ${stale.join(', ')} but there is no passing record for the current working tree ` +
-        `(it was never run, it failed, or files changed afterwards). Run /${stale[0] === 'verify' ? 'verify' : 'review-changes'} again.`;
-    else if (missing.length)
-      problem = `this repo requires ${missing.join(', ')} before committing. Run it, or stamp \`Verified-By: none - <reason>\`.`;
-  }
+if (fp && missing.length && !waiver) {
+  problem =
+    `this repo requires ${missing.join(' and ')} for the current working tree before committing ` +
+    `(never run, failed, or files changed afterwards). Run /${missing[0] === 'verify' ? 'verify' : 'review-changes'}. ` +
+    `If verification genuinely doesn't apply (docs, comments), run \`${CV} waive "<reason>"\` and tell the user. ` +
+    `Don't add a Verified-By trailer to the message; the gate doesn't read it.`;
 }
 
-const base = { repo: info.id, branch: info.branch, mode: cfg.gate, session: input.session_id, fresh, stamp: stamp?.[1]?.trim() ?? null };
+// What the ledger will say about this commit. A clean-tree amend (message reword) keeps whatever
+// the commit it replaces had; with no entry for it (or a commit with no changes) nothing is recorded,
+// so `cv report` falls back to the tree or an old-style trailer.
+let outcome = fp ? { kinds: fresh, missing, waived: missing.length && waiver ? waiver.reason : null } : null;
+if (!fp && amend && info.head) {
+  const prev = readLedger(info).bySha.get(info.head);
+  if (prev) outcome = { kinds: prev.kinds || [], missing: prev.missing, waived: prev.waived || null };
+}
+
+const sid = input.session_id || 'unknown';
+const base = { repo: info.id, branch: info.branch, mode: cfg.gate, session: input.session_id, fresh, waived: outcome?.waived ?? null };
+
+// Handed to post-commit.mjs, which records the commit SHA once it exists.
+const recordPending = () => {
+  if (outcome)
+    writeJson(pendingCommitPath(info), {
+      headBefore: info.head,
+      reflogLength: reflogLength(info),
+      session: sid,
+      time: new Date().toISOString(),
+      ...outcome,
+    });
+  else fs.rmSync(pendingCommitPath(info), { force: true });
+};
 
 const stateFile = path.join(info.stateDir, 'gate.json');
 const state = { blocks: {}, ...readJson(stateFile, {}) };
-const sid = input.session_id || 'unknown';
 
 if (!problem) {
   appendLog({ ...base, decision: 'allow' });
+  recordPending();
   if (state.blocks[sid]) {
     state.blocks[sid] = 0; // a good commit resets the "let it through after N blocks" counter
     writeJson(stateFile, state);
@@ -95,6 +89,7 @@ if (!problem) {
 
 if (cfg.gate !== 'enforce') {
   appendLog({ ...base, decision: 'would-block', problem });
+  recordPending();
   process.exit(0);
 }
 
@@ -104,6 +99,7 @@ if (blocks >= cfg.maxGateBlocks) {
   state.blocks[sid] = 0;
   writeJson(stateFile, state);
   appendLog({ ...base, decision: 'let-through', problem });
+  recordPending();
   process.stdout.write(
     JSON.stringify({
       hookSpecificOutput: {

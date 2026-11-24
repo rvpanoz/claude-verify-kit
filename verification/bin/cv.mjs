@@ -5,11 +5,23 @@ import fs from 'node:fs';
 import path from 'node:path';
 import {
   KIT_DIR, GATE_LOG, KINDS, git, repoInfo, loadConfig, fingerprint, freshKinds, runFastChecks, detectFastChecks,
-  diffPolicy, resolveFile, baseRef, privateRepoDir, readJson, writeJson, ensureDir, recordPath,
+  diffPolicy, resolveFile, baseRef, privateRepoDir, readJson, writeJson, ensureDir, recordPath, waiverFor, waiverPath,
+  readLedger, describeEntry, entryKind,
 } from './lib.mjs';
 
 const [cmd = 'help', ...args] = process.argv.slice(2);
 const info = repoInfo();
+
+// What the commit gate would do with the current tree, in one line.
+function gateVerdict(cfg, fp) {
+  if (!fp) return 'nothing to commit';
+  const fresh = freshKinds(info, fp);
+  const missing = (cfg.require || []).filter((k) => KINDS.includes(k) && !fresh.includes(k));
+  if (!missing.length) return `would allow (${fresh.join(', ') || 'nothing required'})`;
+  const w = waiverFor(info, fp);
+  if (w) return `would allow (waived: ${w.reason})`;
+  return `would ${cfg.gate === 'enforce' ? 'block' : 'log a block'}: needs ${missing.join(', ')}, or cv waive "<reason>"`;
+}
 
 function needRepo() {
   if (!info) {
@@ -28,6 +40,7 @@ First time in a repo:  cv init, then ask Claude to fill in the verify notes. Che
   checks [name...]             run the fast checks (lint/typecheck/test) + diff policy now
   record <verify|review> <pass|fail> [note]
                                record a result for the current working tree (used by the skills)
+  waive <reason>               let the commit gate pass this exact tree without verification (e.g. docs only)
   notes                        print this repo's verify notes (how to boot/drive the app, feature map)
   rules                        print review rules: REVIEW.md from the base branch + reliability checklist
   diff                         print the diff under review (base branch merge-base → working tree)
@@ -38,7 +51,7 @@ First time in a repo:  cv init, then ask Claude to fill in the verify notes. Che
   init                         create this repo's private notes/rules/config from the templates
   where                        show where every file for this repo is read from
   gate [off|observe|enforce]   show or set the global commit-gate mode
-  report [n]                   how the last n commits (default 30) were verified
+  report [n]                   how the last n commits (default 30) were verified (from the commit ledger)
   log [n]                      last n gate decisions (default 20), incl. what observe mode would block`);
   },
 
@@ -56,7 +69,9 @@ First time in a repo:  cv init, then ask Claude to fill in the verify notes. Che
     }
     console.log(`gate         ${cfg.gate}, requires: ${(cfg.require || []).join(', ') || 'nothing'}`);
     console.log(`fast checks  ${detectFastChecks(info, cfg).map((c) => c.cmd).join(' | ') || 'none detected'}`);
-    if (fp) console.log(`stamp to use ${freshKinds(info, fp).length ? 'Verified-By: ' + freshKinds(info, fp).join(', ') : 'Verified-By: none - <reason>'}`);
+    const w = fp && waiverFor(info, fp);
+    if (w) console.log(`waiver       ${w.reason} (${w.time})`);
+    console.log(`commit gate  ${gateVerdict(cfg, fp)}`);
   },
 
   checks() {
@@ -91,7 +106,19 @@ First time in a repo:  cv init, then ask Claude to fill in the verify notes. Che
       process.exit(2);
     }
     writeJson(recordPath(info, kind), { result, fingerprint: fp, head: info.head, branch: info.branch, note: noteParts.join(' ') || undefined, time: new Date().toISOString() });
-    console.log(`recorded ${kind}: ${result} for ${fp}. Stamp: ${freshKinds(info, fp).length ? 'Verified-By: ' + freshKinds(info, fp).join(', ') : 'Verified-By: none - <reason>'}`);
+    console.log(`recorded ${kind}: ${result} for ${fp}. Commit gate: ${gateVerdict(loadConfig(info), fp)}`);
+  },
+
+  waive() {
+    needRepo();
+    const fp = fingerprint(info);
+    if (!fp || !args.join(' ').trim()) {
+      console.error('usage: cv waive <reason>   (needs uncommitted changes)');
+      process.exit(2);
+    }
+    const reason = args.join(' ').trim();
+    writeJson(waiverPath(info), { fingerprint: fp, reason, time: new Date().toISOString() });
+    console.log(`verification waived for this exact tree (${fp}): ${reason}. Any further edit cancels the waiver.`);
   },
 
   notes() {
@@ -205,15 +232,32 @@ First time in a repo:  cv init, then ask Claude to fill in the verify notes. Che
   report() {
     needRepo();
     const n = parseInt(args[0] || '30', 10);
-    const r = git(['log', `-n${n}`, '--format=%h%x1f%an%x1f%s%x1f%(trailers:key=Verified-By,valueonly,separator=%x2C )%x1e'], info.root).out;
+    const { bySha, byTree } = readLedger(info);
+    // %(trailers) is only a fallback for commits stamped by older versions of the kit.
+    const r = git(['log', `-n${n}`, '--format=%H%x1f%T%x1f%an%x1f%s%x1f%(trailers:key=Verified-By,valueonly,separator=%x2C )%x1e'], info.root).out;
     const rows = r.split('\x1e').map((s) => s.trim()).filter(Boolean).map((s) => s.split('\x1f'));
-    const tally = { verified: 0, none: 0, unstamped: 0 };
-    for (const [h, author, subj, stamp] of rows) {
-      const kind = !stamp ? 'unstamped' : /^none/i.test(stamp) ? 'none' : 'verified';
+    const tally = { verified: 0, waived: 0, unverified: 0, unrecorded: 0 };
+    for (const [sha, tree, author, subj, stamp] of rows) {
+      const e = bySha.get(sha) || byTree.get(tree);
+      let label;
+      let kind;
+      if (e) {
+        label = describeEntry(e);
+        kind = entryKind(e);
+      } else if (stamp) {
+        label = 'stamp: ' + stamp;
+        kind = /^none/i.test(stamp) ? 'waived' : 'verified';
+      } else {
+        label = '—';
+        kind = 'unrecorded';
+      }
       tally[kind]++;
-      console.log(`${h}  ${(stamp || '—').padEnd(28).slice(0, 28)}  ${author.slice(0, 14).padEnd(14)}  ${subj.slice(0, 70)}`);
+      console.log(`${sha.slice(0, 7)}  ${label.padEnd(28).slice(0, 28)}  ${author.slice(0, 14).padEnd(14)}  ${subj.slice(0, 70)}`);
     }
-    console.log(`\n${rows.length} commits: ${tally.verified} verified, ${tally.none} stamped none, ${tally.unstamped} unstamped (incl. ones not made through Claude)`);
+    console.log(
+      `\n${rows.length} commits: ${tally.verified} verified, ${tally.waived} waived, ${tally.unverified} unverified, ` +
+        `${tally.unrecorded} unrecorded (not made through Claude, or made before the ledger existed)`,
+    );
   },
 
   log() {
