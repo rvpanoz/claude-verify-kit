@@ -51,11 +51,6 @@ Report to the user in a few lines: the flows you checked, the commands you ran, 
 
 ## 6. When committing
 
-End the commit message with the stamp trailer that `cv status` prints:
+Commit as usual, with no `Verified-By` or other verification trailer in the message. The commit gate checks that a passing record exists for the exact tree being committed, and records the outcome in a local ledger (`cv report`).
 
-```
-Verified-By: verify            # or "verify, review" if /review-changes also passed
-Verified-By: none - <reason>   # only when verification genuinely doesn't apply (docs, comments)
-```
-
-The commit gate checks that the stamp matches a passing record for the exact tree being committed.
+If verification genuinely doesn't apply (docs, comments), run `cv waive "<reason>"` before committing and tell the user. Like a record, a waiver only covers the exact tree it was made for.

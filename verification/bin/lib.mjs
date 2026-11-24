@@ -46,7 +46,10 @@ export function repoInfo(cwd = process.cwd()) {
   const hasHead = git(['rev-parse', '--verify', '-q', 'HEAD'], root).code === 0;
   const head = hasHead ? git(['rev-parse', 'HEAD'], root).out.trim() : null;
   const branch = git(['rev-parse', '--abbrev-ref', 'HEAD'], root).out.trim() || 'detached';
-  return { root, gitDir, stateDir, hasHead, head, branch, id: repoId(root) };
+  // The commit ledger lives in the common git dir so every worktree of the repo shares it.
+  const commonDir = path.resolve(root, git(['rev-parse', '--git-common-dir'], root).out.trim() || gitDir);
+  const ledger = path.join(commonDir, 'claude-verify', 'commits.jsonl');
+  return { root, gitDir, stateDir, hasHead, head, branch, ledger, id: repoId(root) };
 }
 
 // Stable id for the private per-repo folder: origin URL if there is one, else folder name.
@@ -318,4 +321,130 @@ export function freshKinds(info, fp = fingerprint(info)) {
     if (rec && rec.result === 'pass' && fp && rec.fingerprint === fp) fresh.push(k);
   }
   return fresh;
+}
+
+// A waiver lets one exact working tree through the commit gate without verification
+// (e.g. docs only). Any further edit changes the fingerprint and cancels it.
+export function waiverPath(info) {
+  return path.join(info.stateDir, 'waive.json');
+}
+
+export function waiverFor(info, fp = fingerprint(info)) {
+  const w = readJson(waiverPath(info), null);
+  return w && fp && w.fingerprint === fp ? w : null;
+}
+
+// ---------- commit detection ----------
+
+// `git [-C dir] [-c k=v] ... commit ...`
+const COMMIT_RE = /(?:^|[\s;&|(])git((?:\s+(?:-C\s+(?:"[^"]*"|'[^']*'|\S+)|-c\s+\S+|--[\w-]+(?:=\S+)?))*)\s+commit\b/;
+
+// Returns the directory a `git commit` in `command` runs in, or null if it isn't a commit.
+export function commitTarget(command, cwd) {
+  const m = String(command || '').match(COMMIT_RE);
+  if (!m) return null;
+  const dashC = (m[1] || '').match(/-C\s+("([^"]*)"|'([^']*)'|(\S+))/);
+  return { cwd: dashC ? path.resolve(cwd, dashC[2] ?? dashC[3] ?? dashC[4]) : cwd };
+}
+
+// ---------- commit ledger ----------
+// One JSON line per commit Claude made: which records were fresh, or the waiver reason.
+// Nothing goes into the commit message.
+
+export function pendingCommitPath(info) {
+  return path.join(info.stateDir, 'pending-commit.json');
+}
+
+export function readLedger(info) {
+  const bySha = new Map();
+  const byTree = new Map();
+  let raw = '';
+  try {
+    raw = fs.readFileSync(info.ledger, 'utf8');
+  } catch {
+    return { bySha, byTree };
+  }
+  for (const line of raw.split('\n')) {
+    if (!line.trim()) continue;
+    try {
+      const e = JSON.parse(line);
+      if (e.sha) bySha.set(e.sha, e);
+      if (e.tree) byTree.set(e.tree, e);
+    } catch {
+      /* skip bad line */
+    }
+  }
+  return { bySha, byTree };
+}
+
+export function appendLedger(info, entry) {
+  ensureDir(path.dirname(info.ledger));
+  fs.appendFileSync(info.ledger, JSON.stringify(entry) + '\n');
+}
+
+// How a ledger entry counts in reports: verified (everything required was fresh), waived, or unverified.
+// Entries without `missing` predate it: then any fresh record counts as verified.
+export function entryKind(e) {
+  if (e.waived) return 'waived';
+  const ok = Array.isArray(e.missing) ? e.missing.length === 0 : (e.kinds || []).length > 0;
+  return ok ? 'verified' : 'unverified';
+}
+
+// One-line description of how a commit was verified, for reports.
+export function describeEntry(e) {
+  const kinds = (e.kinds || []).join(', ');
+  const kind = entryKind(e);
+  if (kind === 'waived') return (kinds ? kinds + ' + ' : '') + 'waived: ' + e.waived;
+  if (kind === 'verified') return kinds || 'nothing required';
+  return kinds ? `${kinds} (missing ${e.missing.join(', ')})` : 'unverified';
+}
+
+// A pending entry older than this is from a commit that never ran (denied or rejected).
+const PENDING_MAX_AGE_MS = 30 * 60 * 1000;
+
+// Number of entries in this worktree's HEAD reflog (0 if it has none yet).
+export function reflogLength(info) {
+  const r = git(['log', '-g', '--format=%H', 'HEAD'], info.root);
+  return r.code === 0 ? r.out.split('\n').filter(Boolean).length : 0;
+}
+
+// Called after a Bash command that ran `git commit`: writes a ledger entry for each commit the
+// command made, i.e. each `commit*` entry added to this worktree's HEAD reflog since the gate
+// recorded its length. Using the reflog (not just HEAD) keeps `git commit && git checkout other`
+// or `&& git pull --rebase` from recording some other commit. Returns the number of entries written.
+export function settlePending(info, sessionId) {
+  const file = pendingCommitPath(info);
+  const pending = readJson(file, null);
+  if (!pending) return 0;
+  try {
+    fs.rmSync(file, { force: true });
+  } catch {
+    /* best effort */
+  }
+  if (sessionId && pending.session && pending.session !== sessionId) return 0;
+  const since = Date.parse(pending.time);
+  if (!since || Date.now() - since > PENDING_MAX_AGE_MS || !Number.isInteger(pending.reflogLength)) return 0;
+  const r = git(['log', '-g', '--format=%H%x1f%T%x1f%gs', 'HEAD'], info.root);
+  if (r.code !== 0) return 0;
+  const lines = r.out.split('\n').filter(Boolean);
+  const added = lines.slice(0, Math.max(0, lines.length - pending.reflogLength)); // newest first
+  const known = readLedger(info).bySha;
+  const made = [];
+  for (const line of added) {
+    const [sha, tree, subject] = line.split('\x1f');
+    if (/^commit\b/.test(subject || '') && !known.has(sha)) made.push({ sha, tree });
+  }
+  for (const c of made.reverse()) {
+    appendLedger(info, {
+      sha: c.sha,
+      tree: c.tree,
+      kinds: pending.kinds || [],
+      missing: pending.missing || [],
+      waived: pending.waived || null,
+      branch: info.branch,
+      session: pending.session,
+      time: new Date().toISOString(),
+    });
+  }
+  return made.length;
 }
