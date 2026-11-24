@@ -1,0 +1,4 @@
+{
+  "_help": "Per-repo overrides. Keys you can add: gate (off|observe|enforce), require ([\"verify\"] or [\"verify\",\"review\"]), stopHook (true|false), maxStopRounds, checkTimeoutSec, fastChecks ([{\"name\":\"lint\",\"cmd\":\"pnpm lint\"}], or null to auto-detect from package.json).",
+  "fastChecks": null
+}
