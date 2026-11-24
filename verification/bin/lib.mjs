@@ -112,8 +112,12 @@ export function appendLog(entry) {
 }
 
 // ---------- fingerprint of the working tree vs HEAD ----------
-// Same fingerprint before and after `git add`, so a verification recorded before staging
-// still matches at commit time. Any edit afterwards changes it and makes the record stale.
+// Hashes every path that differs from HEAD (tracked changes plus untracked files) with its current
+// content, so it is the same before and after `git add`: staging doesn't matter, only what's on
+// disk. Any edit afterwards changes it and makes the record stale. Read-only: nothing is written
+// to the index or the object store.
+
+const BIG_FILE = 20 * 1024 * 1024;
 
 export function changedState(info) {
   const diffArgs = info.hasHead
@@ -127,23 +131,44 @@ export function changedState(info) {
   return { diff, untracked };
 }
 
+// Paths that differ from HEAD, staged or not, plus untracked (non-ignored) files.
+export function changedPaths(info) {
+  const tracked = info.hasHead
+    ? git(['diff', 'HEAD', '--name-only', '--no-renames', '-z'], info.root).out
+    : git(['ls-files', '--cached', '-z'], info.root).out;
+  const untracked = git(['ls-files', '--others', '--exclude-standard', '-z'], info.root).out;
+  const all = (tracked + '\0' + untracked).split('\0').filter(Boolean).map((p) => p.replace(/\/$/, ''));
+  return [...new Set(all)].sort();
+}
+
+// What a path holds on disk right now, as a short string.
+function pathState(info, rel) {
+  const abs = path.join(info.root, rel);
+  let st;
+  try {
+    st = fs.lstatSync(abs);
+  } catch {
+    return 'deleted';
+  }
+  try {
+    if (st.isSymbolicLink()) return 'link:' + fs.readlinkSync(abs);
+    // A submodule or nested repo: its diff line carries the commit and a "-dirty" marker.
+    if (st.isDirectory()) return 'dir:' + git(['diff', 'HEAD', '--no-color', '--no-ext-diff', '--', rel], info.root).out;
+    const mode = st.mode & 0o111 ? 'x' : '-';
+    // Big files: size and mtime instead of reading them on every check. Staging doesn't touch mtime.
+    if (st.size > BIG_FILE) return `${mode}:big:${st.size}:${st.mtimeMs}`;
+    return `${mode}:` + createHash('sha256').update(fs.readFileSync(abs)).digest('hex');
+  } catch {
+    return `unreadable:${st.size}:${st.mtimeMs}`;
+  }
+}
+
 export function fingerprint(info) {
-  const { diff, untracked } = changedState(info);
-  if (!diff && untracked.length === 0) return null; // clean tree
+  const paths = changedPaths(info);
+  if (!paths.length) return null; // clean tree
   const h = createHash('sha256');
   h.update(info.head || 'no-head');
-  h.update('\0');
-  h.update(diff);
-  for (const f of untracked) {
-    h.update('\0' + f + '\0');
-    try {
-      const st = fs.statSync(path.join(info.root, f));
-      if (st.isFile() && st.size < 20 * 1024 * 1024) h.update(fs.readFileSync(path.join(info.root, f)));
-      else h.update(String(st.size));
-    } catch {
-      /* vanished */
-    }
-  }
+  for (const p of paths) h.update(`\0${p}\0${pathState(info, p)}`);
   return h.digest('hex').slice(0, 16);
 }
 
