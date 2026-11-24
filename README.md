@@ -1,6 +1,6 @@
 # claude-verify-kit
 
-A portable version of the verification setup the Claude Code team describes in Addy Osmani's post. It installs once into `~/.claude` and works in every repo you open, so it moves with you from client to client and nothing gets committed to their codebases.
+A portable verification setup for Claude Code. It installs once into `~/.claude` and works in every repo you open, so it moves with you between projects and nothing gets committed to their codebases.
 
 | Piece | What it does |
 |---|---|
@@ -18,8 +18,10 @@ Each step says **where** to run it.
 
 ### Once, on your machine
 
-**1. Install.** Run this in a terminal, inside the unzipped `claude-verify-kit` folder:
+**1. Install.** Run this in a terminal:
 ```bash
+git clone https://github.com/rvpanoz/claude-verify-kit.git
+cd claude-verify-kit
 node install.mjs --dry-run   # optional: preview what will change
 node install.mjs
 ```
@@ -38,12 +40,12 @@ If you use another shell, add it yourself: `alias cv='node ~/.claude/verificatio
 
 **4. Initialise the repo.** Run this **inside the project folder**, on any branch:
 ```bash
-cd ~/code/portal-client-apps    # your project
+cd ~/code/my-project    # your project
 cv init        # creates private notes, rules and config for this repo
 cv where       # which files are in effect
 cv status      # which lint / typecheck / test commands were detected
 ```
-`cv init` writes `verify.md`, `REVIEW.md` and `verify.config.json` to `~/.claude/verification/repos/<repo>/`, outside the repo, so nothing is committed to the client's code. The folder is tied to the repo's remote URL, so all branches share it. If the team already keeps a committed `REVIEW.md` or `.claude/verify.md`, those take priority automatically.
+`cv init` writes `verify.md`, `REVIEW.md` and `verify.config.json` to `~/.claude/verification/repos/<repo>/`, outside the repo, so nothing is committed to the project's code. The folder is tied to the repo's remote URL, so all branches share it. If the repo already has a committed `REVIEW.md` or `.claude/verify.md`, those take priority automatically.
 
 **5. Fill in the verify notes.** Start `claude` in the project and ask:
 > Fill in my verify notes for this repo: how to boot it, and a feature map of the main user flows.
@@ -124,9 +126,11 @@ Auto-detection uses the `lint`, `typecheck`/`type-check`/`tsc` and `test:unit`/`
 
 ## Limits, honestly
 
-- **It runs on trust.** `cv record verify pass` is a command Claude runs at the end of `/verify`. The gate proves the record matches the exact tree being committed and that nothing changed afterwards, not that the verification was thorough. That's the same trade-off as the Claude Code team's "did the session run /verify" gate. Spot-check the evidence Claude reports.
+- **It runs on trust.** `cv record verify pass` is a command Claude runs at the end of `/verify`. The gate proves the record matches the exact tree being committed and that nothing changed afterwards, not that the verification was thorough. Spot-check the evidence Claude reports.
 - Only commits made **through Claude Code** are gated. Your own terminal commits are untouched (they show as "unstamped" in `cv report`).
 - If your full test suite is slow, set `fastChecks` so the Stop hook stays fast, and keep heavy E2E runs for `/verify`.
 - Commit message detection covers `-m`, heredocs and `-F <file>`. Exotic forms (e.g. a message from an editor) are treated as unstamped.
 
-## Inspired by https://x.com/addyosmani/status/2122590683055993308
+## Credits
+
+Inspired by [Addy Osmani's post](https://x.com/addyosmani/status/2122590683055993308).
